@@ -1,3 +1,17 @@
+"""
+Этап 6: Литературная вычитка/полировка русского текста (по умолчанию gemma).
+
+Логика не менялась относительно ver1.0 — gemma показала себя хорошо. У неё НЕТ
+корейского оригинала (она редактор русского, не переводчик): работает только с
+ФОРМОЙ, держится глоссария, длина результата ограничена коридором
+(PROOFREAD_RATIO_LOW/HIGH) с откатом на черновик. Ловить галлюцинации — задача
+stage5 (двуязычная сверка), а не этой стадии.
+
+Запуск:  python stage6_proofread.py --export-txt
+         python stage6_proofread.py --resume
+         python stage6_proofread.py --retry-fallbacks
+"""
+
 import argparse
 import json
 import os
@@ -21,24 +35,37 @@ MARK_END = "<<<END>>>"
 
 MAX_GLOSSARY_TERMS = 60
 
+# Допустимое отклонение длины вычитки от черновика.
+# Вне коридора → fallback на исходный перевод (защита от того, что редактор
+# дописал отсебятину или выкинул куски текста).
+# Коридор узкий специально: gemma сильна в литературном русском, но слаба в
+# переводе — поэтому ей разрешено только полировать, а не переписывать.
+PROOFREAD_RATIO_HIGH = 1.25  # вычитка длиннее черновика → подозрительно
+PROOFREAD_RATIO_LOW = 0.8   # вычитка короче черновика → подозрительно
+
 
 # ============================================================
 # OLLAMA
 # ============================================================
 
 def call_ollama(
-    prompt: str,
+    system: str,
+    user: str,
     model: str = MODEL_PROOFREAD,
     temperature: float = PROOFREAD_TEMPERATURE,
     num_predict: int = 4096,
-    num_ctx: int = 8192,
+    num_ctx: int = PROOFREAD_NUM_CTX,
     keep_alive: str = "30m",
     max_retries: int = 3,
 ) -> str:
-    url = f"{OLLAMA_BASE_URL}/api/generate"
+    url = f"{OLLAMA_BASE_URL}/api/chat"
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": user})
     payload = {
         "model": model,
-        "prompt": prompt,
+        "messages": messages,
         "stream": False,
         "keep_alive": keep_alive,
         "options": {
@@ -53,7 +80,7 @@ def call_ollama(
         try:
             response = requests.post(url, json=payload, timeout=1200)
             response.raise_for_status()
-            return response.json().get("response", "")
+            return response.json().get("message", {}).get("content", "")
         except requests.exceptions.ConnectionError:
             print("\nОШИБКА: Ollama недоступна. Запустите: ollama serve")
             sys.exit(1)
@@ -61,6 +88,11 @@ def call_ollama(
             last_err = "timeout"
             print(f"\n  ! Timeout (попытка {attempt}/{max_retries})...")
             time.sleep(15)
+        except requests.exceptions.HTTPError as e:
+            body = getattr(e.response, "text", "")
+            print(f"\nОШИБКА HTTP: {e}\n  Ответ Ollama: {body}")
+            print("  Подсказка: 404 обычно = модель не найдена. Сверьте имя в config с `ollama list`.")
+            return ""
         except Exception as e:
             last_err = str(e)
             print(f"\n  ! Ошибка: {e} (попытка {attempt}/{max_retries})")
@@ -124,45 +156,43 @@ def proofread_segment(
         )
 
     if mode == "full":
-        prompt = f"""Ты — редактор русскоязычного перевода с корейского. Твой текст потом будут читать как книгу.
+        system = f"""Ты — литературный редактор. Перед тобой русский перевод корейского ранобэ.
+Твоя сила — живой, естественный русский язык. Сделай текст приятным для чтения.
 
-ЗАДАЧА: улучшить ТОЛЬКО приведённый русский перевод. Сверься с корейским оригиналом, чтобы убедиться в точности смысла.
+ВАЖНО: у тебя НЕТ оригинала. Ты НЕ переводчик — ты редактор русского текста.
+Поэтому НЕ домысливай и НЕ меняй смысл: не добавляй и не убирай факты, события,
+реплики, имена, числа. Работай с ФОРМОЙ, а не с содержанием.
 
-СТРОГИЕ ПРАВИЛА:
-1. НЕ добавляй новых предложений, реплик, описаний, которых нет в корейском оригинале.
-2. НЕ копируй текст из «предыдущего перевода» — он только для согласования стиля.
-3. Длина результата должна быть близка к длине входного перевода (±20%).
-4. Имена и термины — СТРОГО по глоссарию, не меняй их транслитерацию.
-5. Правь грамматику, пунктуацию, неестественные обороты, кальки с корейского.
-6. Сохраняй абзацы, реплики, переносы строк ровно как в исходном переводе.
-7. Если перевод уже хорош — верни его почти без изменений.
-8. Стилистика — живая русская проза, а не подстрочник.
+ЧТО ДЕЛАТЬ:
+1. Убирай кальки с корейского, канцелярит, неуклюжие и «машинные» обороты.
+2. Чини грамматику, согласование, пунктуацию, порядок слов.
+3. Делай диалоги живыми, описания — гладкими, но без отсебятины.
 
-{glossary_section}{context_section}КОРЕЙСКИЙ ОРИГИНАЛ:
----
-{source}
----
-
-ТЕКУЩИЙ РУССКИЙ ПЕРЕВОД:
+ЧЕГО НЕ ДЕЛАТЬ:
+4. НЕ переписывай заново и НЕ пересказывай. Если фраза уже хороша — оставь как есть.
+5. НЕ добавляй новых предложений, мыслей, деталей.
+6. Имена и термины — СТРОГО по глоссарию, транслитерацию не меняй.
+7. Сохрани все абзацы, реплики и переносы строк ровно как во входе.
+8. Длина результата ≈ длине входа (в пределах ±20%)."""
+        user = f"""{glossary_section}{context_section}РУССКИЙ ТЕКСТ ДЛЯ РЕДАКТУРЫ:
 ---
 {translation}
 ---
 
-Выведи ТОЛЬКО улучшенный текст между маркерами. Никаких комментариев,
+Выведи ТОЛЬКО отредактированный текст между маркерами. Никаких комментариев,
 объяснений, JSON. Только маркеры и текст между ними.
 
 {MARK_START}
-(улучшенный перевод здесь)
+(отредактированный текст здесь)
 {MARK_END}
 """
     else:  # light
-        prompt = f"""Ты — корректор русского текста.
+        system = f"""Ты — корректор русского текста.
 
 Сделай МИНИМАЛЬНУЮ правку: только явные ошибки грамматики, пунктуации и неуклюжие фразы.
 НЕ переписывай. НЕ добавляй ничего нового. НЕ меняй имена.
-Длина должна остаться примерно той же.
-
-{glossary_section}РУССКИЙ ТЕКСТ:
+Длина должна остаться примерно той же."""
+        user = f"""{glossary_section}РУССКИЙ ТЕКСТ:
 ---
 {translation}
 ---
@@ -174,7 +204,7 @@ def proofread_segment(
 {MARK_END}
 """
 
-    response = call_ollama(prompt, model=model, temperature=temperature)
+    response = call_ollama(system, user, model=model, temperature=temperature)
     return parse_proofread_response(response, translation)
 
 
@@ -218,14 +248,15 @@ def parse_proofread_response(response: str, original: str) -> dict:
     if not improved or len(improved) < 10:
         return {"improved_text": original, "fallback_reason": "too_short_abs"}
 
+    # Контроль длины: защищаемся от того, что редактор дописал отсебятину
+    # или, наоборот, выкинул куски. Вне коридора → откат на черновик.
     ratio = len(improved) / max(len(original), 1)
-    #if ratio > 1.6:
-    #    print(improved)
-    #    return {"improved_text": original,
-    #            "fallback_reason": f"too_long_ratio={ratio:.2f}"}
-    #if ratio < 0.4:
-    #    return {"improved_text": original,
-    #            "fallback_reason": f"too_short_ratio={ratio:.2f}"}
+    if ratio > PROOFREAD_RATIO_HIGH:
+        return {"improved_text": original,
+                "fallback_reason": f"too_long_ratio={ratio:.2f}"}
+    if ratio < PROOFREAD_RATIO_LOW:
+        return {"improved_text": original,
+                "fallback_reason": f"too_short_ratio={ratio:.2f}"}
 
     # Защита от утечки промпта
     leak_markers = ["КОРЕЙСКИЙ ОРИГИНАЛ", "ГЛОССАРИЙ", "<think>",
@@ -236,7 +267,7 @@ def parse_proofread_response(response: str, original: str) -> dict:
             return {"improved_text": original, "fallback_reason": f"leak:{lm}"}
 
     # Не вернулась ли куча корейского
-    korean_chars = sum(1 for c in improved if "\uac00" <= c <= "\ud7af")
+    korean_chars = sum(1 for c in improved if 0xAC00 <= ord(c) <= 0xD7AF)
     if korean_chars > len(improved) * 0.15:
         return {"improved_text": original,
                 "fallback_reason": f"too_much_korean={korean_chars}"}
@@ -293,7 +324,7 @@ def build_output(results: list, model: str, mode: str) -> dict:
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Этап 4: Вычитка")
+    parser = argparse.ArgumentParser(description="Этап 6: Вычитка (gemma)")
     parser.add_argument("--input", type=str, default=TRANSLATED_FILE)
     parser.add_argument("--glossary", type=str, default=GLOSSARY_FILE)
     parser.add_argument("--output", type=str, default=FINAL_FILE)
@@ -336,7 +367,8 @@ def main():
         print(f"Загружено {len(existing)} уже обработанных")
 
         if not args.no_backup:
-            backup = args.output + f".backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            backup = os.path.join(BACKUP_DIR, os.path.basename(args.output)
+                                   + f".backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
             shutil.copy2(args.output, backup)
             print(f"Бэкап: {backup}")
 
@@ -462,10 +494,11 @@ def main():
     # --- Итоги ---
     total_time = time.time() - run_start
     print("\n" + "=" * 60)
-    print(f"Готово за {total_time/60:.1f} минут")
+    print("Готово за %.1f минут" % (total_time / 60))
     print(f"Обработано: {processed}, fallback: {fallback_count}, "
           f"всего в файле: {len(results)}")
     print(f"Файл: {args.output}")
+    print("Дальше: python stage7_qa.py  (и/или  python export_final.py --format plain)")
 
     if fallback_count > 0:
         print(f"\nДля повторной попытки fallback'ов:")

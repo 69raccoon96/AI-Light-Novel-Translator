@@ -49,11 +49,51 @@ def split_by_regex(text: str, max_chars: int = MAX_SEGMENT_CHARS) -> list:
     return segments
 
 
+def _regex_sentences(paragraph: str) -> list:
+    """Разбиение одного абзаца на предложения regex-ом (запасной вариант для kss)."""
+    sentences = re.split(
+        r'(?<=[.!?。！？])\s+|(?<=[다요죠음임니까][.!?])\s*|(?<=[다요죠음임니까])\s+(?=[A-Z가-힣"\'\(「『])',
+        paragraph
+    )
+    if len(sentences) <= 1:
+        sentences = re.split(r'(?<=[.!?。！？])\s*', paragraph)
+    return [s for s in sentences if s.strip()]
+
+
+_KSS_WARNED = False
+
+
+def _try_kss_split(kss_module, paragraph: str):
+    """Пробуем kss в нескольких конфигурациях.
+    На Windows стабильнее num_workers=1 (иначе multiprocessing часто виснет/падает).
+    Возвращаем (список_предложений | None, последняя_ошибка)."""
+    attempts = [
+        dict(backend="pecab", num_workers=1),
+        dict(backend="mecab", num_workers=1),
+        dict(num_workers=1),
+        dict(),  # совсем старые версии kss без этих аргументов
+    ]
+    last_err = None
+    for kw in attempts:
+        try:
+            return kss_module.split_sentences(paragraph, **kw), None
+        except TypeError as e:
+            last_err = e  # версия kss не знает таких аргументов — пробуем проще
+        except Exception as e:
+            last_err = e
+    return None, last_err
+
+
 def split_by_kss(text: str, max_chars: int = MAX_SEGMENT_CHARS) -> list:
     """
     Разделение с помощью kss (Korean Sentence Splitter).
     Требует: pip install kss pecab
+
+    Если kss падает — НЕ молчим: один раз печатаем реальную причину и
+    откатываемся на regex-разбиение для проблемных абзацев (а не «весь абзац
+    как одно предложение», как было раньше).
     """
+    global _KSS_WARNED
     try:
         import kss
     except ImportError:
@@ -61,21 +101,28 @@ def split_by_kss(text: str, max_chars: int = MAX_SEGMENT_CHARS) -> list:
         print("Или используйте режим regex: python stage1_split.py --method regex")
         sys.exit(1)
 
+    print(f"kss версия: {getattr(kss, '__version__', 'неизвестно')}")
+
     paragraphs = re.split(r'\n\s*\n', text)
     segments = []
+    kss_fail_count = 0
 
     for paragraph in paragraphs:
         paragraph = paragraph.strip()
         if not paragraph:
             continue
 
-        try:
-            sentences = kss.split_sentences(paragraph, backend='pecab')
-        except Exception:
-            try:
-                sentences = kss.split_sentences(paragraph)
-            except Exception:
-                sentences = [paragraph]
+        sentences, err = _try_kss_split(kss, paragraph)
+        if sentences is None:
+            kss_fail_count += 1
+            if not _KSS_WARNED:
+                print("\n  ! kss не сработал. Реальная причина:")
+                print(f"    {type(err).__name__}: {err}")
+                print("    → для таких абзацев использую regex-разбиение.")
+                print("    Подсказка: `pip install kss pecab`; на Windows помогает num_workers=1;")
+                print("    либо просто запусти с `--method regex` — для пайплайна этого достаточно.\n")
+                _KSS_WARNED = True
+            sentences = _regex_sentences(paragraph)
 
         current_segment = ""
         for sentence in sentences:
