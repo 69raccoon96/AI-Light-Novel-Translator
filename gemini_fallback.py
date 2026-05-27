@@ -21,6 +21,7 @@
   python gemini_fallback.py --ids 6,25                # добить конкретные сегменты
   python gemini_fallback.py --ids 6 --also-final      # ещё и обновить 4_final.json
   python gemini_fallback.py --mode polish --ids 14    # перешлифовать сегмент в 4_final.json
+  python gemini_fallback.py --mode glossary           # арбитраж разногласий qwen/aya в глоссарии
 """
 
 import argparse
@@ -83,6 +84,42 @@ POLISH_SYSTEM = (
     "Имена и термины - строго по глоссарию (он в сообщении). Сохраняй разбивку на "
     "абзацы и реплики.\n"
     "Выводи ТОЛЬКО отредактированный русский текст, без пояснений и префиксов."
+)
+
+GLOSSARY_ARBITER_SYSTEM = (
+    "Ты - строгий билингвальный судья перевода КОРЕЙСКОЙ ЛЕКСИКИ на русский для "
+    "ранобэ/веб-новелл (часто уся-фэнтези). Тебе дают спорный термин и ДВА варианта "
+    "русского перевода - от модели A (qwen) и модели B (aya). Твоя задача - выбрать "
+    "правильный или, если оба плохи, предложить третий.\n\n"
+    "ПРАВИЛА (применяй СТРОГО):\n"
+    "1. КОНЦЕПТ-ТЕРМИНЫ С ХАНЧА (поле hanja заполнено): перевод СТРОИТСЯ ПО СМЫСЛУ "
+    "иероглифов, НЕ фонетикой корейского чтения. Голая фонетическая транслитерация "
+    "такого термина - ОШИБКА.\n"
+    "   九陰絶脈 → «меридианы Девяти Инь»   (НЕ «Гуин Цзюймэй»)\n"
+    "   天武之體 → «тело Небесного Воина»   (НЕ «Чхонму Чхи»)\n"
+    "   九劍 → «Девять Мечей»              (НЕ «Гу Гом»)\n"
+    "2. ЗАИМСТВОВАНИЯ из английского/иностранных языков (часто это видно по корейской "
+    "транслитерации - ㅍ=F, ㄹ=L): восстанавливай оригинал, а не транслитерируй вслепую.\n"
+    "   플라이 → Fly (полёт),  아웃복서 → Outboxer / Аутбоксер,\n"
+    "   프로스트 앤빌 → Frost Anvil,  카플란 → Kaplan.\n"
+    "3. ИМЕНА И МЕСТА: транслитерация по системе Концевича, не китайский пиньинь.\n"
+    "   강진호 - «Кан Джинхо» (НЕ «Ган Жэньхао»). Без дефисов в именах.\n"
+    "4. ТИТУЛЫ (фиксированный маппинг): 공작=герцог, 대공=великий герцог, 후작=маркиз,\n"
+    "   변경백=маркграф, 백작=граф, 자작=виконт, 남작=барон. 백작가 = «графский род» "
+    "(НЕ барон).\n"
+    "5. ОМОНИМЫ ХАНЧА: выбирай значение по смыслу контекста (변경 邊境 граница vs 變更 "
+    "перемена; 성 聖 святой vs 城 крепость).\n"
+    "6. ЧИСЛА В ХАНЧА: 一=1, 二=2, 三=3, 九=9, 十=10 - никогда не путай.\n"
+    "7. Не выдумывай ханча, не меняй корейский ключ. Только русская сторона.\n\n"
+    "ФОРМАТ ОТВЕТА: СТРОГО один JSON-объект, без пояснений вне JSON, без markdown:\n"
+    "{\"choice\": \"qwen\" | \"aya\" | \"other\", "
+    "\"russian\": \"итоговый русский перевод\", "
+    "\"reason\": \"кратко почему (1 фраза)\"}\n\n"
+    "- choice=\"qwen\" - вариант A правильный.\n"
+    "- choice=\"aya\"  - вариант B правильный.\n"
+    "- choice=\"other\" - оба плохи, в поле russian свой вариант.\n"
+    "В поле russian ВСЕГДА пиши финальный русский перевод (даже если choice=qwen/aya - "
+    "продублируй выбранный текст)."
 )
 
 
@@ -408,16 +445,225 @@ def run_polish(args, client, glossary):
 
 
 # ============================================================
+# РЕЖИМ GLOSSARY (арбитраж разногласий qwen/aya)
+# ============================================================
+
+def parse_arbiter_json(text: str):
+    """Извлекает {choice/russian/reason} из ответа Gemini.
+    Возвращает либо валидный dict, либо (None, причина_отказа) для аудита."""
+    if not text:
+        return None, "пустой ответ"
+    t = re.sub(r"```\w*\n?", "", text).replace("```", "")
+    # Берём ПОСЛЕДНИЙ JSON-объект — это страховка от пояснений модели до итогового JSON.
+    matches = list(re.finditer(r"\{[\s\S]*?\}", t))
+    if not matches:
+        return None, "нет JSON-объекта"
+    obj = None
+    for m in reversed(matches):
+        try:
+            obj = json.loads(m.group())
+            break
+        except json.JSONDecodeError:
+            continue
+    if not isinstance(obj, dict):
+        return None, "не словарь"
+    choice = str(obj.get("choice", "")).strip().lower()
+    if choice not in ("qwen", "aya", "other"):
+        return None, f"choice='{choice}' не из {{qwen,aya,other}}"
+    russian = str(obj.get("russian", "")).strip()
+    if not russian:
+        return None, "пустой russian"
+    # --- САНИТАРНЫЕ ПРОВЕРКИ СОДЕРЖАНИЯ ---
+    # 1. Длина: один глоссарный термин - короткая строка. Длиннее 200 симв = мусор.
+    if len(russian) > 200:
+        return None, f"слишком длинно ({len(russian)} симв)"
+    # 2. Запрет переноса строк и явной чуши: если есть \n - модель сорвалась в текст.
+    if "\n" in russian:
+        return None, "перевод содержит перенос строки (не одиночный термин)"
+    # 3. Запрет корейских символов в финальном русском переводе.
+    kor = sum(1 for c in russian if 0xAC00 <= ord(c) <= 0xD7AF)
+    if kor > 0:
+        return None, f"в переводе остались корейские символы ({kor})"
+    # 4. Минимум буквенных символов (кириллица+латиница; латиница нужна для
+    #    заимствований типа Fly, Frost Anvil). Без букв - явный мусор.
+    letters = sum(1 for c in russian if c.isalpha())
+    if letters < 2:
+        return None, "почти нет букв"
+    # 5. Если строка слишком похожа на ханча/китайские иероглифы - тоже отбой.
+    han = sum(1 for c in russian if 0x4E00 <= ord(c) <= 0x9FFF)
+    if han > 0 and han * 3 >= letters:
+        return None, "в переводе много ханча/кит. иероглифов"
+    reason = str(obj.get("reason", "")).strip()[:200]
+    return {"choice": choice, "russian": russian, "reason": reason}, ""
+
+
+def run_glossary(args, client):
+    """Арбитраж разногласий qwen vs aya из 2_glossary_disagreements.json.
+    Применяет выбор Gemini к 2_glossary.json и пишет лог в .txt."""
+    dis_path = os.path.join(OUTPUT_DIR, "2_glossary_disagreements.json")
+    if not os.path.exists(dis_path):
+        print(f"Нет файла {dis_path}. Запусти stage3_glossary_check сперва.")
+        return
+    with open(dis_path, "r", encoding="utf-8") as f:
+        dis_data = json.load(f)
+    disagreements = dis_data.get("disagreements", [])
+    if not disagreements:
+        print("Разногласий нет - ничего не делаю.")
+        return
+
+    # Опциональный фильтр по конкретным корейским ключам
+    forced_keys = set()
+    if args.ids:
+        forced_keys = {s.strip() for s in args.ids.replace(";", ",").split(",") if s.strip()}
+    if forced_keys:
+        disagreements = [d for d in disagreements if d.get("korean") in forced_keys]
+        if not disagreements:
+            print(f"Указанных корейских ключей нет в файле разногласий.")
+            return
+
+    if args.limit > 0:
+        disagreements = disagreements[:args.limit]
+
+    glossary_path = args.input or GLOSSARY_FILE
+    if not os.path.exists(glossary_path):
+        print(f"ОШИБКА: нет файла глоссария {glossary_path}")
+        return
+    with open(glossary_path, "r", encoding="utf-8") as f:
+        gloss_data = json.load(f)
+    by_key = {(t.get("korean") or "").strip(): t for t in gloss_data.get("terms", [])}
+
+    # Идемпотентность: термины, по которым Gemini уже выносил вердикт, пропускаем
+    # (если только пользователь явно не указал их через --ids).
+    if not forced_keys:
+        before = len(disagreements)
+        disagreements = [d for d in disagreements
+                         if (by_key.get(d.get("korean")) or {}).get("arbiter") != "gemini"]
+        skipped = before - len(disagreements)
+        if skipped:
+            print(f"Пропускаю уже размеченных Gemini: {skipped} (повторный запуск)")
+        if not disagreements:
+            print("Все разногласия уже разобраны Gemini. Используй --ids для пересмотра.")
+            return
+
+    print(f"Режим GLOSSARY (арбитр Gemini)  |  модель: {args.model}")
+    print(f"Разногласий к разбору: {len(disagreements)}")
+    for d in disagreements:
+        hj = (" [" + d["hanja"] + "]") if d.get("hanja") else ""
+        print(f"  {d['korean']}{hj}  qwen: {d.get('qwen','')!r}  aya: {d.get('aya','')!r}")
+
+    if args.dry_run:
+        print("\n--dry-run: вызовов Gemini не было, файл не изменён.")
+        return
+
+    if not args.no_backup:
+        backup(glossary_path)
+
+    log_lines = [f"Арбитраж Gemini ({args.model}) по разногласиям qwen vs aya",
+                 "=" * 60]
+    counts = {"qwen": 0, "aya": 0, "other": 0, "parse_error": 0, "missing": 0}
+
+    for i, d in enumerate(disagreements):
+        kor = d["korean"]
+        hanja = d.get("hanja", "")
+        cat = d.get("category", "")
+        note = d.get("note", "")
+        q = d.get("qwen", "")
+        a = d.get("aya", "")
+
+        # Чтобы быть нейтральным, помечаем варианты как A/B, а соответствие моделям знаем у себя.
+        # Случайно не меняем порядок (детерминированно — A=qwen, B=aya), но в промпте подписываем.
+        user_lines = [
+            f"Korean: {kor}",
+        ]
+        if hanja:
+            user_lines.append(f"Hanja: {hanja}")
+        if cat:
+            user_lines.append(f"Category: {cat}")
+        if note:
+            user_lines.append(f"Note: {note[:140]}")
+        user_lines.append("")
+        user_lines.append(f"Variant A (qwen): {q}")
+        user_lines.append(f"Variant B (aya):  {a}")
+        user_lines.append("")
+        user_lines.append("Выбери правильный или предложи третий. Ответ - один JSON.")
+        prompt = GLOSSARY_ARBITER_SYSTEM + "\n\n" + "\n".join(user_lines)
+
+        print(f"[{i+1}/{len(disagreements)}] {kor}"
+              f"{(' ['+hanja+']') if hanja else ''} -> Gemini...", flush=True)
+        raw = call_gemini(client, args.model, prompt, args.temperature)
+        verdict, reject_reason = parse_arbiter_json(raw)
+        if not verdict:
+            counts["parse_error"] += 1
+            print(f"  ! отбой ({reject_reason}) - оставляю значение aya: {a!r}")
+            log_lines.append(f"\n{kor}{(' ['+hanja+']') if hanja else ''}")
+            log_lines.append(f"  qwen: {q}")
+            log_lines.append(f"  aya : {a}")
+            log_lines.append(f"  GEMINI: REJECT [{reject_reason}] "
+                             f"(raw: {(raw or '')[:120]!r})")
+            continue
+
+        target = by_key.get(kor)
+        if not target:
+            counts["missing"] += 1
+            print(f"  ! термина {kor!r} нет в {glossary_path} - пропускаю")
+            continue
+
+        # Записываем выбор Gemini
+        target["qwen_russian"] = q
+        target["aya_russian"] = a
+        target["arbiter"] = "gemini"
+        target["arbiter_choice"] = verdict["choice"]
+        target["arbiter_reason"] = verdict["reason"]
+        target["russian"] = verdict["russian"]
+        counts[verdict["choice"]] += 1
+
+        log_lines.append(f"\n{kor}{(' ['+hanja+']') if hanja else ''}")
+        log_lines.append(f"  qwen: {q}")
+        log_lines.append(f"  aya : {a}")
+        log_lines.append(f"  GEMINI [{verdict['choice']}]: {verdict['russian']}")
+        if verdict["reason"]:
+            log_lines.append(f"    причина: {verdict['reason']}")
+
+        preview = (verdict["russian"][:60]).replace("\n", " ")
+        print(f"  {verdict['choice'].upper()}: {preview}"
+              + ("..." if len(verdict['russian']) > 60 else ""))
+
+        # Сохраняем после каждого вердикта (на случай прерывания)
+        gloss_data.setdefault("metadata", {})["arbiter"] = "gemini"
+        gloss_data["metadata"]["arbiter_last_run"] = datetime.now().isoformat()
+        atomic_save(gloss_data, glossary_path)
+
+        if i < len(disagreements) - 1:
+            time.sleep(args.delay)
+
+    # Финальный лог
+    log_path = os.path.join(OUTPUT_DIR, "2_glossary_gemini_arbiter.txt")
+    log_lines.append("\n" + "=" * 60)
+    log_lines.append(f"Итого: qwen={counts['qwen']}  aya={counts['aya']}  "
+                     f"other={counts['other']}  parse_error={counts['parse_error']}  "
+                     f"missing={counts['missing']}")
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(log_lines) + "\n")
+
+    print(f"\nГотово. Файл глоссария: {glossary_path}")
+    print(f"Лог арбитража:           {log_path}")
+    print(f"Итого: qwen={counts['qwen']}  aya={counts['aya']}  other={counts['other']}"
+          f"  parse_error={counts['parse_error']}  missing={counts['missing']}")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
 def main():
     p = argparse.ArgumentParser(description="Ручной облачный фолбэк через Gemini")
-    p.add_argument("--mode", choices=["translate", "polish"], default="translate",
-                   help="translate: чинить 3_translated.json; polish: перешлифовать 4_final.json")
+    p.add_argument("--mode", choices=["translate", "polish", "glossary"], default="translate",
+                   help="translate: чинить 3_translated.json; polish: перешлифовать 4_final.json; "
+                        "glossary: арбитр разногласий qwen/aya в 2_glossary.json")
     p.add_argument("--input", default=None, help="Переопределить входной файл")
     p.add_argument("--glossary", default=GLOSSARY_FILE)
-    p.add_argument("--ids", default="", help="Конкретные id через запятую (напр. 6,25)")
+    p.add_argument("--ids", default="", help="Конкретные id (translate/polish) ИЛИ "
+                                              "корейские ключи через запятую (glossary)")
     p.add_argument("--include-check-failed", action="store_true",
                    help="(translate) добавить сегменты с check_failed")
     p.add_argument("--also-final", action="store_true",
@@ -431,6 +677,14 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="Только показать кандидатов, без вызовов")
     p.add_argument("--no-backup", action="store_true")
     args = p.parse_args()
+
+    # Режим glossary работает с файлом глоссария напрямую — отдельный путь
+    if args.mode == "glossary":
+        client = None
+        if not args.dry_run:
+            client = make_client(read_api_key(args))
+        run_glossary(args, client)
+        return
 
     glossary = []
     try:

@@ -28,6 +28,7 @@ import re
 import shutil
 import sys
 import time
+from datetime import datetime
 
 import requests
 
@@ -227,7 +228,7 @@ def main():
         json.dump(out, f, ensure_ascii=False, indent=2)
     os.replace(tmp, args.input)
 
-    # Отчёт разногласий — кандидаты на редкую облачную сверку
+    # Отчёт разногласий — кандидаты на арбитраж Gemini (gemini_fallback --mode glossary)
     dis_path = os.path.join(OUTPUT_DIR, "2_glossary_disagreements.txt")
     with open(dis_path, "w", encoding="utf-8") as f:
         f.write(f"Разногласий: {len(disagreements)}  (qwen → {args.model})\n")
@@ -236,9 +237,34 @@ def main():
             hj = originals[k].get("hanja", "")
             f.write(f"{k}{(' ['+hj+']') if hj else ''}\n  qwen: {q}\n  aya : {a}\n\n")
 
+    # Структурированный JSON — для автоматического арбитража Gemini
+    dis_json_path = os.path.join(OUTPUT_DIR, "2_glossary_disagreements.json")
+    dis_json = {
+        "metadata": {
+            "check_model": args.model,
+            "disagreements": len(disagreements),
+            "generated_at": datetime.now().isoformat(),
+        },
+        "disagreements": [
+            {
+                "korean": k,
+                "hanja": originals[k].get("hanja", ""),
+                "category": originals[k].get("category", ""),
+                "note": (originals[k].get("note", "") or ""),
+                "qwen": q,
+                "aya": a,
+            }
+            for k, q, a in disagreements
+        ],
+    }
+    with open(dis_json_path, "w", encoding="utf-8") as f:
+        json.dump(dis_json, f, ensure_ascii=False, indent=2)
+
     print(f"\nГотово. {args.input} обновлён (korean/hanja-ключи сохранены от qwen).")
-    print(f"Разногласий: {len(disagreements)} → {dis_path} (бегло глянь/отдай облаку)")
-    print("Дальше: python stage4_translate.py")
+    print(f"Разногласий: {len(disagreements)} → {dis_path}")
+    print(f"                            {dis_json_path}")
+    print("Дальше: python gemini_fallback.py --mode glossary  (арбитр разногласий)")
+    print("Или сразу: python stage4_translate.py")
 
 
 if __name__ == "__main__":
