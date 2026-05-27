@@ -36,67 +36,82 @@ if errorlevel 1 (
 
 rem ---- 1: split ----
 if exist "output\1_segments.json" (
-  echo [1/12] split - already done, skip
+  echo [1/13] split - already done, skip
 ) else (
-  echo [1/12] stage1_split - split...
+  echo [1/13] stage1_split - split...
   %PY% stage1_split.py >> "%LOG%" 2>&1
   if errorlevel 1 goto fail
 )
 
 rem ---- 2: glossary ----
 if exist "output\2_glossary.json" (
-  echo [2/12] glossary - already done, skip
+  echo [2/13] glossary - already done, skip
 ) else (
-  echo [2/12] stage2_glossary - glossary qwen...
+  echo [2/13] stage2_glossary - glossary qwen...
   %PY% stage2_glossary.py >> "%LOG%" 2>&1
   if errorlevel 1 goto fail
 )
 
-rem ---- 3: glossary cross-check (stage3 creates 2_glossary.qwen.json) ----
-if exist "output\2_glossary.qwen.json" (
-  echo [3/12] glossary check - already done, skip
+rem ---- 3: glossary cross-check (stage3) ----
+rem  Done-marker is 2_glossary.checked.json (written ONLY at the very end of stage3).
+rem  Previous check by 2_glossary.qwen.json was wrong: that file is created in
+rem  the first second and did NOT mean completion.
+rem  With --resume stage3 either continues from its checkpoint, or starts fresh,
+rem  or exits immediately if the stage was already finished previously.
+if exist "output\2_glossary.checked.json" (
+  echo [3/13] glossary check - already done, skip
 ) else (
-  echo [3/12] stage3_glossary_check - glossary check aya...
-  %PY% stage3_glossary_check.py >> "%LOG%" 2>&1
+  echo [3/13] stage3_glossary_check - glossary check aya, resume...
+  %PY% stage3_glossary_check.py --resume >> "%LOG%" 2>&1
   if errorlevel 1 goto fail
 )
 
 rem ---- 4: gemini arbiter for glossary disagreements ----
 rem    Idempotent: if disagreements file is missing or empty, just no-ops.
 rem    Skips gracefully without an API key (errorlevel != 0, but we continue).
-echo [4/12] gemini_fallback --mode glossary - arbitrate qwen/aya glossary disagreements...
+echo [4/13] gemini_fallback --mode glossary - arbitrate qwen/aya glossary disagreements...
 %PY% gemini_fallback.py --mode glossary >> "%LOG%" 2>&1
 if errorlevel 1 echo    ! gemini_fallback glossary error, continuing - see log
 
-echo [5/12] stage4_translate - translate qwen, resume...
+echo [5/13] stage4_translate - translate qwen, resume...
 %PY% stage4_translate.py --resume >> "%LOG%" 2>&1
 if errorlevel 1 goto fail
 
-echo [6/12] stage5_translate_check - translation check aya, resume...
+echo [6/13] stage5_translate_check - translation check aya, resume...
 %PY% stage5_translate_check.py --resume >> "%LOG%" 2>&1
 if errorlevel 1 goto fail
 
-echo [7/12] gemini_fallback - fix what local models could not...
+echo [7/13] gemini_fallback - fix what local models could not...
 %PY% gemini_fallback.py --include-check-failed >> "%LOG%" 2>&1
 if errorlevel 1 echo    ! gemini_fallback error, continuing - see log
 
-echo [8/12] stage6_proofread - literary proofread gemma, resume...
+echo [8/13] stage6_proofread - literary proofread gemma, resume...
 %PY% stage6_proofread.py --resume --export-txt >> "%LOG%" 2>&1
 if errorlevel 1 goto fail
 
-echo [9/12] gemini_fallback --mode polish - polish leftover fallbacks...
+echo [9/13] gemini_fallback --mode polish - polish leftover fallbacks...
 %PY% gemini_fallback.py --mode polish >> "%LOG%" 2>&1
 if errorlevel 1 echo    ! gemini_fallback polish error, continuing - see log
 
-echo [10/12] stage7_qa - mechanical QA...
+echo [10/13] stage7_qa - mechanical QA...
 %PY% stage7_qa.py >> "%LOG%" 2>&1
 if errorlevel 1 echo    ! stage7_qa error, continuing
 
-echo [11/12] stage8_judge - final judge Magistral, resume...
+echo [11/13] stage8_judge - final judge Magistral, resume...
 %PY% stage8_judge.py --resume >> "%LOG%" 2>&1
 if errorlevel 1 echo    ! stage8_judge error, continuing
 
-echo [12/12] export_final - clean text...
+rem ---- 12: stage9 judge-fix via Gemini ----
+rem    Reads 6_judge_report.json and patches 4_final.json for problematic segments.
+rem    Has its own cost gate (default 100 requests). If count > threshold and stdout
+rem    is redirected (this case), the script exits with errorlevel 1 and tells you
+rem    to run manually with --yes / --limit. We just continue the pipeline then.
+rem    Quota/network failures don't mark items -- resumed automatically next run.
+echo [12/13] stage9_judge_fix - patch problematic segments via Gemini, resume...
+%PY% stage9_judge_fix.py --resume >> "%LOG%" 2>&1
+if errorlevel 1 echo    ! stage9_judge_fix exited with code 1 - see log (likely too many targets, run manually with --yes)
+
+echo [13/13] export_final - clean text...
 %PY% export_final.py --format plain >> "%LOG%" 2>&1
 
 echo.
