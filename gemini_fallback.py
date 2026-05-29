@@ -547,9 +547,34 @@ def run_glossary(args, client):
 
     print(f"Режим GLOSSARY (арбитр Gemini)  |  модель: {args.model}")
     print(f"Разногласий к разбору: {len(disagreements)}")
-    for d in disagreements:
+    # Краткая превью без раздувания лога: первые 8 и хвост счётчика
+    show_n = min(8, len(disagreements))
+    for d in disagreements[:show_n]:
         hj = (" [" + d["hanja"] + "]") if d.get("hanja") else ""
         print(f"  {d['korean']}{hj}  qwen: {d.get('qwen','')!r}  aya: {d.get('aya','')!r}")
+    if len(disagreements) > show_n:
+        print(f"  ... и ещё {len(disagreements) - show_n}")
+
+    # Cost gate: при большом числе разногласий не молотим Gemini без подтверждения
+    if len(disagreements) > args.max_auto and not args.yes and not args.dry_run:
+        if sys.stdout.isatty():
+            try:
+                ans = input(
+                    f"\nБудет отправлено {len(disagreements)} запросов в Gemini "
+                    f"(порог --max-auto {args.max_auto}). Продолжить? [y/N]: "
+                )
+            except EOFError:
+                ans = ""
+            if ans.strip().lower() not in ("y", "yes", "д", "да"):
+                print("Отменено пользователем.")
+                return
+        else:
+            print(f"\nОТКАЗ: будет {len(disagreements)} запросов > порога --max-auto {args.max_auto}.")
+            print("  Запусти вручную с одним из:")
+            print("    python gemini_fallback.py --mode glossary --yes")
+            print(f"    python gemini_fallback.py --mode glossary --limit {args.max_auto}")
+            print(f"    python gemini_fallback.py --mode glossary --max-auto {len(disagreements)}")
+            sys.exit(1)
 
     if args.dry_run:
         print("\n--dry-run: вызовов Gemini не было, файл не изменён.")
@@ -561,6 +586,8 @@ def run_glossary(args, client):
     log_lines = [f"Арбитраж Gemini ({args.model}) по разногласиям qwen vs aya",
                  "=" * 60]
     counts = {"qwen": 0, "aya": 0, "other": 0, "parse_error": 0, "missing": 0}
+    consecutive_empty = 0
+    aborted_by_quota = False
 
     for i, d in enumerate(disagreements):
         kor = d["korean"]
@@ -591,6 +618,21 @@ def run_glossary(args, client):
         print(f"[{i+1}/{len(disagreements)}] {kor}"
               f"{(' ['+hanja+']') if hanja else ''} -> Gemini...", flush=True)
         raw = call_gemini(client, args.model, prompt, args.temperature)
+
+        # Quota auto-abort: 3 подряд пустых ответа — вероятно исчерпан лимит API
+        if not raw:
+            consecutive_empty += 1
+            print(f"  ! пустой ответ Gemini ({consecutive_empty}/3)")
+            log_lines.append(f"\n{kor}{(' ['+hanja+']') if hanja else ''}")
+            log_lines.append(f"  GEMINI: EMPTY (нет ответа)")
+            if consecutive_empty >= 3:
+                aborted_by_quota = True
+                print(f"\n3 подряд пустых ответа — вероятно исчерпан лимит API или нет сети.")
+                print("  Прерываю прогон. Запусти заново позже — продолжу с этого ключа.")
+                break
+            continue
+        consecutive_empty = 0
+
         verdict, reject_reason = parse_arbiter_json(raw)
         if not verdict:
             counts["parse_error"] += 1
@@ -642,6 +684,9 @@ def run_glossary(args, client):
     log_lines.append(f"Итого: qwen={counts['qwen']}  aya={counts['aya']}  "
                      f"other={counts['other']}  parse_error={counts['parse_error']}  "
                      f"missing={counts['missing']}")
+    if aborted_by_quota:
+        not_processed = len(disagreements) - sum(counts.values())
+        log_lines.append(f"Прервано по quota: не обработано {not_processed} ключей")
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("\n".join(log_lines) + "\n")
 
@@ -649,6 +694,12 @@ def run_glossary(args, client):
     print(f"Лог арбитража:           {log_path}")
     print(f"Итого: qwen={counts['qwen']}  aya={counts['aya']}  other={counts['other']}"
           f"  parse_error={counts['parse_error']}  missing={counts['missing']}")
+    if aborted_by_quota:
+        not_processed = len(disagreements) - sum(counts.values())
+        print(f"\n! Прервано по 3 пустым ответам подряд (вероятно квота).")
+        print(f"  Не обработано: {not_processed}.")
+        print("  Запусти позже:  python gemini_fallback.py --mode glossary")
+
 
 
 # ============================================================
@@ -676,6 +727,11 @@ def main():
     p.add_argument("--delay", type=float, default=1.0)
     p.add_argument("--dry-run", action="store_true", help="Только показать кандидатов, без вызовов")
     p.add_argument("--no-backup", action="store_true")
+    p.add_argument("--max-auto", type=int, default=100,
+                   help="(glossary) Порог запросов без подтверждения. Больше - спросит "
+                        "или потребует --yes. Default 100.")
+    p.add_argument("--yes", action="store_true",
+                   help="(glossary) Не спрашивать подтверждения, отправлять любое количество.")
     args = p.parse_args()
 
     # Режим glossary работает с файлом глоссария напрямую — отдельный путь

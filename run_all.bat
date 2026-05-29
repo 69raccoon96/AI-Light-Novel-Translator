@@ -67,8 +67,9 @@ if exist "output\2_glossary.checked.json" (
 )
 
 rem ---- 4: gemini arbiter for glossary disagreements ----
-rem    Idempotent: if disagreements file is missing or empty, just no-ops.
-rem    Skips gracefully without an API key (errorlevel != 0, but we continue).
+rem    Idempotent: skips terms already arbitered. If disagreements file is
+rem    missing or empty, just no-ops. Skips gracefully without an API key
+rem    (errorlevel != 0, but we continue).
 echo [4/13] gemini_fallback --mode glossary - arbitrate qwen/aya glossary disagreements...
 %PY% gemini_fallback.py --mode glossary >> "%LOG%" 2>&1
 if errorlevel 1 echo    ! gemini_fallback glossary error, continuing - see log

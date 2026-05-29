@@ -38,9 +38,20 @@ MAX_GLOSSARY_TERMS = 60
 CATEGORY_PRIORITY = [
     "name_male", "name_female", "name",
     "place", "org", "title", "address",
+    "term",                                  # концепт-термины с ханча — сразу после титулов
     "skill", "monster", "item",
-    "term", "other",
+    "other",
 ]
+
+# Категории, где короткие 1-символьные ключи легитимны (фамилии типа 박,
+# обращения типа 예 и т.п.). Для остальных категорий 1-символьные ключи
+# фильтруются: они засоряют match (попадают в любой сегмент) и вытесняют
+# реально важные многосимвольные термины с ханча.
+SHORT_KEY_ALLOWED_CATEGORIES = {
+    "name_male", "name_female", "name", "name_pair",
+    "address", "title",
+}
+MIN_KEY_LEN = 2  # минимум корейских символов для всех остальных категорий
 
 CATEGORY_TITLES_RU = {
     "name_male":   "Мужские имена",
@@ -131,11 +142,19 @@ def call_ollama(
 def find_relevant_terms(glossary_terms: list, segment_text: str,
                         max_terms: int = MAX_GLOSSARY_TERMS) -> list:
     """Термины из глоссария, реально встречающиеся в сегменте.
-    Сортирует по частоте и длине (длинные приоритетнее)."""
+    Сортирует по частоте и длине (длинные приоритетнее).
+
+    Отсекает 1-символьные ключи в нестандартных категориях (item/monster/skill/
+    term/...), чтобы они не спамили match и не вытесняли длинные концепт-термины.
+    Имена, обращения и титулы могут быть короткими — для них фильтр снят."""
     matched = []
     for t in glossary_terms:
         kor = (t.get("korean") or "").strip()
         if not kor:
+            continue
+        cat = t.get("category", "")
+        # фильтр коротких ключей: только для нестандартных категорий
+        if len(kor) < MIN_KEY_LEN and cat not in SHORT_KEY_ALLOWED_CATEGORIES:
             continue
         count = segment_text.count(kor)
         if count > 0:
