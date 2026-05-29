@@ -38,9 +38,9 @@ APIKEY_FILE = os.path.join(BASE_DIR, "apikey.txt")
 # Финальный судья (LLM-as-judge) - ОЦЕНИВАЕТ финальный перевод, НЕ меняет его.
 # Magistral - рассуждающая модель (даёт <think>...</think>), это нормально, скрипт чистит.
 MODEL_JUDGE = "magistral:24b"   # сверь тег: ollama list; квант: magistral:24b-small-2506-q4_K_M
-JUDGE_NUM_CTX = 8192
+JUDGE_NUM_CTX = 16384           # запас на промпт (KO+RU+глоссарий ~3-5К) + длинный <think>
 JUDGE_TEMPERATURE = 0.2
-JUDGE_NUM_PREDICT = 6000        # запас на рассуждение + итоговый JSON
+JUDGE_NUM_PREDICT = 4000        # запас на рассуждение + итоговый JSON (умещается в 16K-промпт)
 JUDGE_REPORT_FILE = os.path.join(OUTPUT_DIR, "6_judge_report.json")
 
 # ============================================================

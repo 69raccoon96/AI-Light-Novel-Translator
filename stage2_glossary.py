@@ -177,12 +177,17 @@ def normalize_glossary(terms: list, model: str,
                        chunk_size: int = GLOSSARY_NORMALIZE_CHUNK) -> list:
     """Второй проход: дубликаты, разные романизации, унификация переводов.
     Разбиваем на чанки, чтобы не переполнять контекст на больших глоссариях.
-    korean и hanja НЕ меняются — они источник истины и восстанавливаются по карте."""
+    korean и hanja НЕ меняются — они источник истины и восстанавливаются по карте.
+
+    На выходе финальный дедуп по стрипнутому korean: если модель-нормализатор
+    случайно вернула ключ с невидимым отличием (лишний пробел, иной регистр),
+    дубль не утечёт в файл."""
     if not terms:
         return terms
 
-    rom_map = {t.get("korean"): t.get("romanization", "") for t in terms}
-    hanja_map = {t.get("korean"): t.get("hanja", "") for t in terms}
+    # Карты строим по СТРИПНУТОМУ корейскому, чтобы поиск работал стабильно
+    rom_map = {(t.get("korean") or "").strip(): t.get("romanization", "") for t in terms}
+    hanja_map = {(t.get("korean") or "").strip(): t.get("hanja", "") for t in terms}
     fixed_all = []
 
     total_chunks = (len(terms) + chunk_size - 1) // chunk_size
@@ -202,13 +207,16 @@ def normalize_glossary(terms: list, model: str,
             fixed_all.extend(chunk)
             continue
 
-        # Приводим компактный формат обратно + восстанавливаем romanization/hanja по карте
+        # Приводим компактный формат обратно + восстанавливаем romanization/hanja по карте.
+        # Стрипаем korean — это первая линия защиты от дублей из-за пробелов.
         restored = []
         for t in fixed:
-            kor = t.get("korean") or t.get("k") or ""
+            kor = ((t.get("korean") or t.get("k") or "")).strip()
+            if not kor:
+                continue
             restored.append({
                 "korean": kor,
-                "hanja": hanja_map.get(kor, t.get("hanja") or t.get("h") or ""),
+                "hanja": hanja_map.get(kor, (t.get("hanja") or t.get("h") or "")),
                 "russian": t.get("russian") or t.get("r") or "",
                 "category": t.get("category") or t.get("c") or "",
                 "note": t.get("note") or t.get("n") or "",
@@ -218,13 +226,30 @@ def normalize_glossary(terms: list, model: str,
         fixed_all.extend(restored)
         time.sleep(1)
 
-    # Подстраховка: если по какой-то причине потеряли термины — добираем
-    seen = {t.get("korean") for t in fixed_all}
+    # Подстраховка: если потеряли термины при нормализации — добираем из исходных
+    seen = {(t.get("korean") or "").strip() for t in fixed_all}
     for t in terms:
-        if t.get("korean") not in seen:
+        k = (t.get("korean") or "").strip()
+        if k and k not in seen:
             fixed_all.append(t)
+            seen.add(k)
 
-    return fixed_all
+    # Финальный дедуп по стрипнутому korean (первое вхождение побеждает).
+    # Это закрывает дыру, когда чанк-нормализатор возвращал ключ с пробелом /
+    # иной нормализацией, а потом страховочный дозабор добавлял оригинал поверх.
+    uniq = {}
+    for t in fixed_all:
+        k = (t.get("korean") or "").strip()
+        if not k or k in uniq:
+            continue
+        t["korean"] = k   # сохраняем стрипнутый, чтобы дальше не плодить дубли
+        uniq[k] = t
+
+    if len(uniq) < len(fixed_all):
+        print(f"  Финальный дедуп: убрано {len(fixed_all) - len(uniq)} дублей "
+              f"(было {len(fixed_all)}, стало {len(uniq)})")
+
+    return list(uniq.values())
 
 
 def seed_honorifics(terms: list) -> list:
